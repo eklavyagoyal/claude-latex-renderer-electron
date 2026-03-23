@@ -1,19 +1,22 @@
-import { app, BrowserWindow, shell } from 'electron';
+import { app, BrowserWindow, net, shell } from 'electron';
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
-import { pathToFileURL } from 'node:url';
 
 const CLAUDE_URL = process.env.CLAUDE_URL ?? 'https://claude.ai';
+const CLAUDE_PARTITION = process.env.CLAUDE_PARTITION ?? '';
+const DEBUG_WINDOW = process.env.DEBUG_CLAUDE_WINDOW === '1';
+const LOCAL_ASSET_PREFIX = '/_cldr_assets';
 const SHORTCUT_MODIFIER = process.platform === 'darwin' ? 'Meta' : 'Control';
 
 let cachedInjection: Promise<{ config: string; mathjax: string; injected: string }> | null =
   null;
+const configuredSessions = new WeakSet<Electron.Session>();
 
 async function loadInjectionSources() {
   if (!cachedInjection) {
     const distDir = __dirname;
     cachedInjection = Promise.all([
-      Promise.resolve(getMathJaxConfig(pathToFileURL(path.join(distDir, 'vendor')).href)),
+      Promise.resolve(getMathJaxConfig(getLocalAssetRootUrl())),
       readFile(path.join(distDir, 'vendor', 'mathjax.js'), 'utf8'),
       readFile(path.join(distDir, 'injected.js'), 'utf8'),
     ]).then(([config, mathjax, injected]) => ({ config, mathjax, injected }));
@@ -22,16 +25,32 @@ async function loadInjectionSources() {
   return cachedInjection;
 }
 
-function getMathJaxConfig(mathjaxRootUrl: string) {
+function getClaudeOrigin() {
+  try {
+    return new URL(CLAUDE_URL).origin;
+  } catch {
+    return 'https://claude.ai';
+  }
+}
+
+function getLocalAssetRootUrl() {
+  return `${getClaudeOrigin()}${LOCAL_ASSET_PREFIX}`;
+}
+
+function getMathJaxConfig(assetRootUrl: string) {
   return `
     window.MathJax = {
       loader: {
         paths: {
-          mathjax: ${JSON.stringify(mathjaxRootUrl)}
+          mathjax: ${JSON.stringify(assetRootUrl)},
+          'mathjax-newcm': ${JSON.stringify(`${assetRootUrl}/mathjax-newcm-font`)}
         }
       },
       startup: {
         typeset: false
+      },
+      output: {
+        font: 'mathjax-newcm'
       },
       tex: {
         inlineMath: [['$', '$'], ['\\\\(', '\\\\)']],
@@ -41,13 +60,85 @@ function getMathJaxConfig(mathjaxRootUrl: string) {
       options: {
         skipHtmlTags: ['script', 'noscript', 'style', 'textarea', 'pre', 'code', 'option'],
         ignoreHtmlClass: 'tex2jax_ignore|mathjax_ignore|cldr-math-ignore',
-        processHtmlClass: 'cldr-math-force'
+        processHtmlClass: 'cldr-math-force',
+        enableMenu: false,
+        enableExplorer: false,
+        enableComplexity: false,
+        enableEnrichment: false,
+        enableBraille: false,
+        enableSpeech: false
       },
       svg: {
-        fontCache: 'local'
+        fontCache: 'none'
       }
     };
   `;
+}
+
+function getAssetContentType(filePath: string) {
+  switch (path.extname(filePath)) {
+    case '.js':
+      return 'text/javascript; charset=utf-8';
+    case '.json':
+      return 'application/json; charset=utf-8';
+    case '.woff':
+      return 'font/woff';
+    case '.woff2':
+      return 'font/woff2';
+    case '.ttf':
+      return 'font/ttf';
+    case '.otf':
+      return 'font/otf';
+    default:
+      return 'application/octet-stream';
+  }
+}
+
+function resolveLocalAssetPath(urlString: string) {
+  const url = new URL(urlString);
+  if (url.origin !== getClaudeOrigin() || !url.pathname.startsWith(`${LOCAL_ASSET_PREFIX}/`)) {
+    return null;
+  }
+
+  const relativeAssetPath = decodeURIComponent(url.pathname.slice(LOCAL_ASSET_PREFIX.length + 1));
+  const vendorDir = path.join(__dirname, 'vendor');
+  const assetPath = path.join(vendorDir, relativeAssetPath);
+  const relativeToVendor = path.relative(vendorDir, assetPath);
+
+  if (relativeToVendor.startsWith('..') || path.isAbsolute(relativeToVendor)) {
+    return null;
+  }
+
+  return assetPath;
+}
+
+function attachLocalAssetProxy(window: BrowserWindow) {
+  const { session } = window.webContents;
+  if (configuredSessions.has(session)) {
+    return;
+  }
+
+  configuredSessions.add(session);
+  session.protocol.handle('https', async (request) => {
+    const localAssetPath = resolveLocalAssetPath(request.url);
+    if (!localAssetPath) {
+      return net.fetch(request, { bypassCustomProtocolHandlers: true });
+    }
+
+    try {
+      const data = await readFile(localAssetPath);
+      return new Response(data, {
+        status: 200,
+        headers: {
+          'content-type': getAssetContentType(localAssetPath),
+          'cache-control': 'public, max-age=31536000, immutable',
+        },
+      });
+    } catch (error) {
+      console.error('Failed to serve local asset', localAssetPath, error);
+      return new Response('Not found', { status: 404 });
+    }
+  });
 }
 
 async function injectEnhancements(window: BrowserWindow) {
@@ -108,6 +199,50 @@ function attachWindowDiagnostics(window: BrowserWindow) {
 
   window.webContents.on('render-process-gone', (_event, details) => {
     console.error('Renderer process exited', details);
+  });
+
+  if (!DEBUG_WINDOW) {
+    return;
+  }
+
+  window.webContents.on('did-start-loading', () => {
+    console.log('Page started loading');
+  });
+
+  window.webContents.on('did-stop-loading', () => {
+    console.log('Page stopped loading', window.webContents.getURL());
+  });
+
+  window.webContents.on('did-navigate', (_event, url) => {
+    console.log('Navigated', url);
+  });
+
+  window.webContents.on('did-navigate-in-page', (_event, url) => {
+    console.log('Navigated in page', url);
+  });
+
+  window.webContents.on('page-title-updated', (_event, title) => {
+    console.log('Page title updated', title);
+  });
+
+  window.webContents.on('did-finish-load', () => {
+    void window.webContents
+      .executeJavaScript(
+        `(() => ({
+          href: location.href,
+          readyState: document.readyState,
+          title: document.title,
+          bodyChildCount: document.body?.childElementCount ?? 0,
+          bodyTextLength: document.body?.innerText?.length ?? 0,
+          bodyHtmlPreview: (document.body?.innerHTML ?? '').slice(0, 1200)
+        }))();`
+      )
+      .then((snapshot) => {
+        console.log('DOM snapshot after load', snapshot);
+      })
+      .catch((error) => {
+        console.error('Failed to capture DOM snapshot', error);
+      });
   });
 }
 
@@ -174,13 +309,14 @@ function createMainWindow() {
       contextIsolation: true,
       sandbox: true,
       nodeIntegration: false,
-      partition: 'persist:claude-latex-renderer',
+      ...(CLAUDE_PARTITION ? { partition: CLAUDE_PARTITION } : {}),
     },
   });
 
   attachWindowDiagnostics(window);
   attachKeyboardShortcuts(window);
   attachNavigationBehavior(window);
+  attachLocalAssetProxy(window);
 
   window.webContents.setUserAgent(getClaudeLikeUserAgent(window));
 
